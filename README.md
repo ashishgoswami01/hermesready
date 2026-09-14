@@ -71,11 +71,44 @@ the Star Health blue — and the whole app follows.
 Push to GitHub and import the repo on [Vercel](https://vercel.com/new); the framework is
 auto-detected and no environment variables are needed for Phase 1.
 
-## Phase 2 (not built yet)
+## Phase 2 (built) — Google Drive → RAG
 
-- Persist settings server-side instead of `localStorage`
-- Real Google Drive connection test and document indexing
-- Live WhatsApp session state, conversation log, activity log
-- Auth so only the training desk can open `/admin`
+Setup and deployment steps are in [SETUP.md](./SETUP.md).
 
-Credentials stay in server-side environment variables from Phase 2 onward — never in the browser.
+| Route | Does |
+| ----- | ---- |
+| `GET/POST /api/settings` | reads and writes the `app_settings` row |
+| `POST /api/drive/test` | real service-account check: resolves the folder, lists indexable files |
+| `POST /api/sync` | one bounded ingestion pass; returns `hasMore` |
+| `GET /api/kb/status` | chunk counts, per-file state, last run |
+| `POST /api/ask` | grounded answer via the `answer` Edge Function |
+| `GET /api/cron/sync` | scheduled refresh, gated by `CRON_SECRET` |
+
+| Screen | Does |
+| ------ | ---- |
+| `/admin` | setup progress, chunk count, flow explainer |
+| `/admin/settings` | the six-step wizard, now saving server-side |
+| `/admin/knowledge` | per-file index status, Sync now |
+| `/admin/chat` | test bench — same retrieval and guardrails as WhatsApp |
+
+```
+lib/
+  drive.ts            service-account auth, folder listing, download/export
+  extract.ts          PDF (unpdf), DOCX (mammoth), text; refuses the unreadable
+  chunk.ts            sentence-aware chunking, capped at gte-small's limit
+  sync.ts             the ingestion orchestrator (resumable, replace-on-update)
+  server-settings.ts  app_settings read/write + sanitising
+  supabase.ts         service-role client + Edge Function caller
+  api.ts              browser-side wrappers
+proxy.ts              HTTP Basic auth over /admin and /api
+supabase/functions/   ingest (embed) and answer (grounded generation)
+```
+
+Credentials live only in server-side environment variables — nothing is
+`NEXT_PUBLIC_`, so the service-role key never reaches the browser.
+
+## Phase 3 (next)
+
+- WhatsApp channel: contact tiers, session limits, quiet hours, number lists
+- Conversation and activity log screens
+- Drive push notifications instead of polling

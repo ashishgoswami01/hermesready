@@ -102,7 +102,13 @@ export type Errors = Partial<Record<keyof Settings, string>>;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const DRIVE_ID_RE = /^[A-Za-z0-9_-]{15,}$/;
 
-/** Parses one-number-per-line text; returns valid entries and bad line numbers. */
+/**
+ * Parses one-number-per-line text; returns valid entries and the bad lines.
+ *
+ * A trailing note is cut at the first letter ("919876543210 - VIP" keeps the
+ * number), then every remaining non-digit is stripped — so the spaced form
+ * people actually paste, "+91 98765 43210", parses instead of being rejected.
+ */
 export function parseNumbers(raw: string) {
   const lines = raw
     .split(/\r?\n/)
@@ -113,8 +119,10 @@ export function parseNumbers(raw: string) {
   const invalid: string[] = [];
 
   for (const line of lines) {
-    // allow "919876543210 - VIP note"
-    const digits = line.split(/[\s,–-]/)[0].replace(/[^\d]/g, "");
+    const letterAt = line.search(/[A-Za-zऀ-ॿ]/);
+    const numberPart = letterAt === -1 ? line : line.slice(0, letterAt);
+    const digits = numberPart.replace(/\D/g, "");
+
     if (digits.length >= 10 && digits.length <= 15) valid.push(digits);
     else invalid.push(line);
   }
@@ -142,8 +150,10 @@ export function validateStep(step: number, s: Settings): Errors {
   if (step === 2) {
     const size = num(s.chunkSize);
     const overlap = num(s.chunkOverlap);
-    if (!Number.isFinite(size) || size < 200 || size > 4000)
-      e.chunkSize = "Use a value between 200 and 4000.";
+    // gte-small truncates past 512 tokens (~1800 characters), so anything
+    // larger would silently drop the tail of every chunk.
+    if (!Number.isFinite(size) || size < 200 || size > 1800)
+      e.chunkSize = "Use a value between 200 and 1800 characters.";
     if (!Number.isFinite(overlap) || overlap < 0 || overlap > 1000)
       e.chunkOverlap = "Use a value between 0 and 1000.";
     else if (Number.isFinite(size) && overlap >= size)
@@ -176,6 +186,11 @@ export function validateStep(step: number, s: Settings): Errors {
   return e;
 }
 
+/**
+ * localStorage is only a draft cache now — it keeps half-finished typing across
+ * a refresh. app_settings in Postgres is the source of truth every server
+ * route reads, so the wizard writes to both and prefers the server on load.
+ */
 export function load(): { settings: Settings; completed: number[] } | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);

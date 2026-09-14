@@ -19,6 +19,13 @@ import {
 import { CheckPill, Field, FieldRow, Toggle } from "@/components/field";
 import { Stepper, StepperMobile } from "@/components/stepper";
 import {
+  fetchSettings,
+  runSyncPass,
+  saveSettings,
+  testDrive,
+  type DriveTestResult,
+} from "@/lib/api";
+import {
   DEFAULTS,
   FILE_TYPES,
   STEPS,
@@ -40,34 +47,66 @@ export default function SettingsPage() {
   const [hydrated, setHydrated] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [testing, setTesting] = useState(false);
+  const [driveTest, setDriveTest] = useState<DriveTestResult | null>(null);
   const [finished, setFinished] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /* ---------- hydrate from localStorage ----------
-     localStorage isn't readable during SSR, so this has to run on mount.
-     The component shows a spinner until `hydrated` flips, which keeps the
-     server and client markup identical. */
-  /* eslint-disable react-hooks/set-state-in-effect */
+  /* ---------- hydrate ----------
+     app_settings in Postgres is the source of truth, so the server wins; the
+     localStorage draft is the fallback when the row is still empty (or the
+     request fails), which keeps a half-finished setup from being lost. Neither
+     is readable during SSR, so this runs on mount and the component shows a
+     spinner until `hydrated` flips — that keeps server and client markup
+     identical. */
   useEffect(() => {
-    const stored = load();
-    if (stored) {
-      setSettings(stored.settings);
-      setCompleted(stored.completed);
-      const next = stored.completed.length
-        ? Math.min(Math.max(...stored.completed) + 1, TOTAL_STEPS)
-        : 1;
-      setStep(next);
-    }
-    setHydrated(true);
-  }, []);
-  /* eslint-enable react-hooks/set-state-in-effect */
+    let alive = true;
 
-  /* ---------- autosave ---------- */
+    const apply = (s: Settings, c: number[]) => {
+      if (!alive) return;
+      setSettings(s);
+      setCompleted(c);
+      setStep(c.length ? Math.min(Math.max(...c) + 1, TOTAL_STEPS) : 1);
+    };
+
+    void (async () => {
+      const draft = load();
+      try {
+        const remote = await fetchSettings();
+        if (remote.completed.length || remote.updatedAt) {
+          apply(remote.settings, remote.completed);
+        } else if (draft) {
+          apply(draft.settings, draft.completed);
+        }
+      } catch {
+        if (draft) apply(draft.settings, draft.completed);
+        if (alive) toast.error("Couldn't reach the server — editing a local draft.");
+      } finally {
+        if (alive) setHydrated(true);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /* ---------- autosave ----------
+     localStorage is written on every keystroke; the server write is debounced
+     so typing a folder ID doesn't fire twenty requests. */
   const persist = useCallback((s: Settings, c: number[]) => {
     save(s, c);
     setSavedAt(Date.now());
     if (savedTimer.current) clearTimeout(savedTimer.current);
     savedTimer.current = setTimeout(() => setSavedAt(null), 2200);
+
+    if (pushTimer.current) clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(() => {
+      // A partially-filled step fails server validation; that's fine, the draft
+      // is already safe locally and the next valid write catches up.
+      void saveSettings(s, c).catch(() => {});
+    }, 900);
   }, []);
 
   const set = useCallback(
@@ -118,14 +157,27 @@ export default function SettingsPage() {
       return;
     }
     setTesting(true);
-    // Placeholder until Phase 2 wires the Drive API.
-    await new Promise((r) => setTimeout(r, 900));
-    setTesting(false);
-    toast.success("Credentials look well-formed. Live check arrives in Phase 2.");
-    advance();
+    setDriveTest(null);
+    try {
+      const result = await testDrive(settings.driveFolderId.trim(), settings.fileTypes);
+      setDriveTest(result);
+      toast.success(
+        `Connected to "${result.folder.name}" — ${result.indexableFiles} of ${result.totalFiles} file(s) indexable.`,
+      );
+      if (result.indexableFiles === 0) {
+        toast.warning("Nothing to index yet. Add files, or tick more types in the next step.");
+      }
+      advance();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setErrors({ driveFolderId: message });
+      toast.error(message);
+    } finally {
+      setTesting(false);
+    }
   };
 
-  const finish = () => {
+  const finish = async () => {
     for (let i = 1; i < TOTAL_STEPS; i++) {
       const found = validateStep(i, settings);
       if (Object.keys(found).length) {
@@ -136,20 +188,54 @@ export default function SettingsPage() {
       }
     }
     const all = Array.from({ length: TOTAL_STEPS }, (_, i) => i + 1);
-    setCompleted(all);
-    persist(settings, all);
-    setFinished(true);
-    toast.success("All settings saved to this browser.");
+
+    try {
+      await saveSettings(settings, all);
+      setCompleted(all);
+      save(settings, all);
+      setFinished(true);
+      toast.success("Settings saved. Hermes will use these from the next refresh.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
   };
 
-  const reset = () => {
+  /** First import, kicked off straight from the finish screen. */
+  const indexNow = async () => {
+    setSyncing(true);
+    let indexed = 0;
+    try {
+      for (;;) {
+        const result = await runSyncPass();
+        if (result.status === "failed") throw new Error(result.error ?? "Sync failed.");
+        indexed += result.indexed + result.updated;
+        if (!result.hasMore) break;
+        toast.info(`${indexed} file(s) done · ${result.pending} to go…`);
+      }
+      toast.success(
+        indexed ? `${indexed} file(s) indexed.` : "Knowledge bank is already up to date.",
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const reset = async () => {
     clear();
     setSettings(DEFAULTS);
     setCompleted([]);
     setErrors({});
+    setDriveTest(null);
     setFinished(false);
     setStep(1);
-    toast.success("Setup reset to defaults.");
+    try {
+      await saveSettings(DEFAULTS, []);
+      toast.success("Setup reset to defaults.");
+    } catch {
+      toast.success("Setup reset in this browser.");
+    }
   };
 
   const progress = Math.round((completed.length / TOTAL_STEPS) * 100);
@@ -265,6 +351,30 @@ export default function SettingsPage() {
                       spellCheck={false}
                     />
                   </Field>
+
+                  {driveTest && (
+                    <div className="rounded-[8px] border border-border-base bg-surface-subtle p-3.5">
+                      <div className="flex items-center gap-1.5 text-[13px] font-medium">
+                        <CheckCircle2 size={14} className="text-success" />
+                        {driveTest.folder.name}
+                      </div>
+                      <p className="mt-1 text-[12.5px] text-text-secondary">
+                        {driveTest.indexableFiles} of {driveTest.totalFiles} file
+                        {driveTest.totalFiles === 1 ? "" : "s"} match the selected types.
+                        {driveTest.ignoredTypes.length > 0 &&
+                          ` Ignored: ${driveTest.ignoredTypes.join(", ")}.`}
+                      </p>
+                      {driveTest.preview.length > 0 && (
+                        <ul className="mt-2 space-y-0.5 text-[12.5px] text-text-tertiary">
+                          {driveTest.preview.map((f) => (
+                            <li key={f.name} className="truncate">
+                              · {f.name}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -519,9 +629,35 @@ export default function SettingsPage() {
                           Setup complete
                         </div>
                         <p className="mt-0.5 text-[12.5px] leading-relaxed text-text-secondary">
-                          Settings are stored in this browser. Phase 2 will push them to the
-                          Hermes backend.
+                          Saved to the Hermes backend. The scheduled refresh will pick up the
+                          Drive folder on its own — or index it right now.
                         </p>
+                        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-secondary h-8"
+                            onClick={indexNow}
+                            disabled={syncing}
+                          >
+                            {syncing ? (
+                              <>
+                                <Loader2 size={13} className="animate-spin" /> Indexing…
+                              </>
+                            ) : (
+                              <>
+                                <Cloud size={13} /> Index the folder now
+                              </>
+                            )}
+                          </button>
+                          <Link href="/admin/knowledge" className="btn btn-ghost h-8">
+                            Knowledge bank
+                            <ArrowRight size={13} />
+                          </Link>
+                          <Link href="/admin/chat" className="btn btn-ghost h-8">
+                            Test a question
+                            <ArrowRight size={13} />
+                          </Link>
+                        </div>
                       </div>
                     </div>
                   )}

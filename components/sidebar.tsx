@@ -12,11 +12,11 @@ import {
 } from "lucide-react";
 
 const NAV = [
-  { href: "/admin", label: "Overview", icon: LayoutDashboard, soon: true },
+  { href: "/admin", label: "Overview", icon: LayoutDashboard, soon: false },
   { href: "/admin/settings", label: "Settings", icon: Settings, soon: false },
-  { href: "/admin/knowledge", label: "Knowledge bank", icon: BookOpen, soon: true },
+  { href: "/admin/knowledge", label: "Knowledge bank", icon: BookOpen, soon: false },
+  { href: "/admin/chat", label: "Ask Hermes", icon: MessageSquare, soon: false },
   { href: "/admin/numbers", label: "Numbers", icon: ListFilter, soon: true },
-  { href: "/admin/conversations", label: "Conversations", icon: MessageSquare, soon: true },
   { href: "/admin/logs", label: "Activity log", icon: ScrollText, soon: true },
 ];
 
@@ -75,9 +75,9 @@ export function Sidebar() {
       </nav>
 
       <div className="m-2 rounded-[8px] border border-border-base bg-surface p-3">
-        <div className="eyebrow">Phase 1</div>
+        <div className="eyebrow">Phase 2</div>
         <p className="mt-1.5 text-[12.5px] leading-relaxed text-text-secondary">
-          Frontend + guided settings. Backend wiring lands in Phase 2.
+          Drive ingestion and grounded answers are live. WhatsApp routing is next.
         </p>
       </div>
     </aside>
