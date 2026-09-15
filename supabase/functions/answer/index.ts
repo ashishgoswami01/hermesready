@@ -1,6 +1,8 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
+import { callGemini } from "./gemini.ts";
+
 /**
  * Hermes RAG answer endpoint.
  *
@@ -23,10 +25,31 @@ const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const admin = createClient(SUPABASE_URL, SERVICE_KEY);
 
-const MODELS = [
-  Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash",
-  "gemini-2.0-flash",
-].filter((m, i, a) => a.indexOf(m) === i);
+/**
+ * Reads a secret, tolerating the two mistakes the Supabase secrets UI hides:
+ * a trailing space in the NAME (which the input keeps and the list doesn't
+ * show) and the wrong case. Values are trimmed too — a stray newline from a
+ * paste would otherwise travel into the Authorization header.
+ *
+ * `nearMiss` is what makes a wrong name debuggable: without it the function
+ * can only say "key not set" while the key is sitting right there under
+ * "Gemini_Api_key ".
+ */
+function readSecret(canonical: string): { value: string | null; nearMiss: string | null } {
+  const exact = Deno.env.get(canonical)?.trim();
+  if (exact) return { value: exact, nearMiss: null };
+
+  const wanted = canonical.toLowerCase().replace(/[\s_-]/g, "");
+  for (const [name, raw] of Object.entries(Deno.env.toObject())) {
+    if (name.trim().toLowerCase().replace(/[\s_-]/g, "") !== wanted) continue;
+    const value = String(raw).trim();
+    if (!value) continue;
+    // Usable, but say so loudly rather than papering over it.
+    console.warn(`Using secret "${name}" for ${canonical} — please rename it to ${canonical}.`);
+    return { value, nearMiss: name };
+  }
+  return { value: null, nearMiss: null };
+}
 
 type Match = {
   id: number;
@@ -108,7 +131,7 @@ function buildPrompt(
 
   const context = matches
     .map((m, i) => {
-      const label = m.source === "drive" ? (m.file_name ?? m.product) : m.product;
+      const label = m.source === "prospectus" ? m.product : (m.file_name ?? m.product);
       const uin = m.uin ? ` · UIN ${m.uin}` : "";
       return `[${i + 1}] ${label}${uin}\n${m.content}`;
     })
@@ -141,44 +164,6 @@ ${context}
 QUESTION: ${question}
 
 Answer:`;
-}
-
-async function callGemini(
-  prompt: string,
-  apiKey: string,
-): Promise<{ text: string; model: string }> {
-  let lastError = "";
-
-  for (const model of MODELS) {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 700, topP: 0.9 },
-        }),
-      },
-    );
-
-    if (res.ok) {
-      const data = await res.json();
-      const text = (data?.candidates?.[0]?.content?.parts ?? [])
-        .map((p: { text?: string }) => p.text ?? "")
-        .join("")
-        .trim();
-      if (text) return { text, model };
-      lastError = `${model} returned no text (${data?.candidates?.[0]?.finishReason ?? "unknown reason"})`;
-      continue;
-    }
-
-    lastError = `${model}: ${res.status} ${(await res.text()).slice(0, 300)}`;
-    // 404 means this model name isn't available to the key — try the next one.
-    if (res.status !== 404) break;
-  }
-
-  throw new Error(`Gemini call failed — ${lastError}`);
 }
 
 const NO_ANSWER =
@@ -264,9 +249,14 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const apiKey = Deno.env.get("GEMINI_API_KEY");
+    const { value: apiKey, nearMiss } = readSecret("GEMINI_API_KEY");
     if (!apiKey) {
-      // Retrieval still works without a key; say so rather than pretend.
+      // Retrieval still works without a key; say so rather than pretend. Name
+      // the secrets that ARE visible, so a typo is one glance to find.
+      const visible = Object.keys(Deno.env.toObject())
+        .filter((n) => !n.startsWith("SUPABASE_") && !n.startsWith("SB_") && !n.startsWith("DENO_"))
+        .map((n) => JSON.stringify(n));
+
       await log({
         grounded: false,
         match_count: matches.length,
@@ -276,7 +266,11 @@ Deno.serve(async (req: Request) => {
       return new Response(
         JSON.stringify({
           error:
-            "GEMINI_API_KEY is not set on the Supabase project, so retrieval ran but no answer could be written. Add it under Edge Functions -> Secrets.",
+            "GEMINI_API_KEY is not set, so retrieval ran but no answer could be written. Add it under Edge Functions -> Secrets.",
+          secrets_visible_to_this_function: visible,
+          hint: visible.length
+            ? "Check the names above for a case difference or a trailing space — the Supabase secrets UI keeps both and shows neither."
+            : "No custom secrets are set on this project yet.",
           retrieval_only: true,
           sources,
           product_filter: productFilter,
@@ -293,10 +287,12 @@ Deno.serve(async (req: Request) => {
     const answer = signature && channel === "whatsapp" ? `${text}\n\n${signature}` : text;
 
     // The model refusing is a real signal, not a failure: it means retrieval
-    // returned chunks that don't actually cover the question.
-    const grounded =
-      !/nahi mila|not (in|found in) the (context|knowledge)|cannot find|don't have (that|this) information/i
-        .test(text);
+    // returned chunks that don't actually cover the question. The Hinglish
+    // phrasings matter as much as the English ones — the prompt asks for
+    // Hinglish, so that is how a refusal actually arrives.
+    const REFUSAL =
+      /(jankari|jaankari|information|answer|jawab)[^.]{0,30}(nahi|not)\s*(mila|milli|hai|di gayi|available|found)|nahi mila|nahi di gayi|context me[ni]?n?\s+(koi\s+)?(jankari|jaankari|detail)|not (in|found in|available in) the (context|knowledge|provided)|cannot find|do(n't| not) have (that|this|enough) information/i;
+    const grounded = !REFUSAL.test(text);
 
     await log({ answer, grounded, match_count: matches.length, sources, model });
 
@@ -308,6 +304,9 @@ Deno.serve(async (req: Request) => {
         product_filter: productFilter,
         model,
         latency_ms: Date.now() - started,
+        ...(nearMiss
+          ? { warning: `Secret is named "${nearMiss}"; rename it to GEMINI_API_KEY.` }
+          : {}),
       }),
       { headers: { "Content-Type": "application/json" } },
     );

@@ -45,6 +45,24 @@ GEMINI_API_KEY = <the key>
 Until this exists, `answer` returns 503 with a clear message and retrieval
 still works — so search can be tested before generation is wired.
 
+**The name has to be exact.** The Supabase secrets field keeps a trailing space
+and shows nothing to tell you it's there — a key saved as `Gemini_Api_key `
+looks perfectly fine in the list and is invisible to the function. Copy-paste
+`GEMINI_API_KEY` instead of typing it. If a key ever looks unset, the 503 from
+`answer` now lists every secret name it *can* see, so a case or whitespace slip
+is one glance away; the function also accepts a near-miss name and tells you to
+rename it, rather than failing silently.
+
+**Model names go stale.** `gemini-2.0-flash` and `gemini-2.5-flash` were both
+retired by September 2026. `supabase/functions/answer/gemini.ts` holds a
+preference list (currently `gemini-3.6-flash`) and, if every name in it 404s,
+asks Google's ListModels which flash-class model the key can actually use and
+carries on with that. Set `GEMINI_MODEL` as a secret to pin a specific one.
+
+Verified live on 2026-09-15 with `gemini-3.6-flash`: warm answers land in
+4–6 seconds; the first call after a cold start takes longer while the function
+settles on a thinking setting.
+
 ## Step 2 — Push to GitHub
 
 The repo `ashishgoswami01/hermesready` has **only the root files**; `app/`,
