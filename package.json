@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "verify": "esbuild scripts/verify.mts --bundle --platform=node --format=esm --outfile=node_modules/.cache/verify.mjs --packages=external --log-level=error && node node_modules/.cache/verify.mjs"
+    "verify": "esbuild scripts/verify.mts --bundle --platform=node --format=esm --outfile=node_modules/.cache/verify.mjs --packages=external --log-level=error && node node_modules/.cache/verify.mjs",
+    "e2e": "esbuild scripts/e2e.mts --bundle --platform=node --format=esm --outfile=node_modules/.cache/e2e.mjs --packages=external --log-level=error && node node_modules/.cache/e2e.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0",

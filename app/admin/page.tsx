@@ -91,7 +91,7 @@ export default function OverviewPage() {
                 {status.totals.chunks.toLocaleString("en-IN")}
               </div>
               <div className="mt-1.5 text-[12.5px] text-text-tertiary">
-                chunks · {status.files.indexed} Drive file
+                chunks · {status.files.indexed} document
                 {status.files.indexed === 1 ? "" : "s"} indexed
               </div>
               {status.files.failed > 0 && (
@@ -130,13 +130,14 @@ export default function OverviewPage() {
         <div className="eyebrow">How the flow runs</div>
         <ol className="mt-3 space-y-2.5 text-[13px] leading-relaxed text-text-secondary">
           <li>
-            <span className="font-medium text-text">1 · Upload</span> — drop a file into the
-            shared Drive folder.
+            <span className="font-medium text-text">1 · Add</span> — drop a file on the
+            knowledge page (indexed immediately), or into the connected Drive folder.
           </li>
           <li>
-            <span className="font-medium text-text">2 · Detect</span> — the scheduled refresh
-            compares Drive&apos;s checksums against what&apos;s indexed
-            {status ? ` (every ${status.refreshEveryMinutes} min)` : ""}.
+            <span className="font-medium text-text">2 · Detect</span> — a browser upload goes
+            straight through; for Drive, the scheduled refresh compares checksums against
+            what&apos;s indexed
+            {status?.driveConfigured ? ` (every ${status.refreshEveryMinutes} min)` : ""}.
           </li>
           <li>
             <span className="font-medium text-text">3 · Extract &amp; chunk</span> — PDF, DOCX,

@@ -1,4 +1,4 @@
-import { chunkText, clampChunkSize } from "./chunk";
+import { clampChunkSize } from "./chunk";
 import {
   DriveError,
   allowedMimeTypes,
@@ -6,30 +6,28 @@ import {
   listFiles,
   type DriveFile,
 } from "./drive";
-import { UnsupportedFile, extractTextFrom } from "./extract";
+import {
+  indexAndRecord,
+  markFailed,
+  removeSource,
+  type IndexOutcome,
+  type SourceDoc,
+} from "./indexer";
 import { readSettings } from "./server-settings";
-import { callEdgeFunction, supabaseAdmin } from "./supabase";
+import { supabaseAdmin } from "./supabase";
 
 /**
- * The ingestion pass: Drive folder -> text -> chunks -> embeddings -> pgvector.
+ * The Google Drive ingestion pass. Extraction, chunking and embedding live in
+ * `indexer.ts`; this file owns only what is Drive-specific — listing a folder,
+ * deciding what changed, and downloading bytes.
  *
  * One invocation is deliberately bounded. Serverless functions get 60 seconds,
- * and a folder of 40 PDFs takes far longer than that, so a run processes files
- * until its time budget is nearly spent and reports `hasMore`. The caller (the
- * admin dashboard or the cron route) simply calls again until `hasMore` is
- * false. That makes a big first import a series of short, resumable steps
- * instead of one request that dies at the timeout with nothing written.
+ * and a folder of 40 PDFs takes far longer, so a run processes files until its
+ * time budget is nearly spent and reports `hasMore`. The caller (the admin
+ * dashboard or the cron route) calls again until that's false. A big first
+ * import therefore becomes a series of short, resumable steps instead of one
+ * request that dies at the timeout with nothing written.
  */
-
-const EMBED_BATCH = 40;
-
-export type FileOutcome = {
-  driveFileId: string;
-  name: string;
-  status: "indexed" | "updated" | "failed" | "skipped" | "removed";
-  chunks?: number;
-  reason?: string;
-};
 
 export type SyncResult = {
   runId: number | null;
@@ -42,23 +40,28 @@ export type SyncResult = {
   chunksAdded: number;
   pending: number;
   hasMore: boolean;
-  files: FileOutcome[];
+  files: IndexOutcome[];
   error?: string;
 };
 
 type RegistryRow = {
-  drive_file_id: string;
+  source_key: string;
   md5: string | null;
   modified_time: string | null;
   status: string;
 };
 
-function sourceUrl(file: DriveFile): string {
-  return `https://drive.google.com/file/d/${file.id}/view`;
-}
-
-function titleOf(name: string): string {
-  return name.replace(/\.[a-z0-9]{1,5}$/i, "").trim() || name;
+function toSourceDoc(file: DriveFile): SourceDoc {
+  return {
+    sourceKey: file.id,
+    sourceType: "drive",
+    name: file.name,
+    mimeType: file.mimeType,
+    sourceUrl: `https://drive.google.com/file/d/${file.id}/view`,
+    md5: file.md5Checksum ?? null,
+    modifiedTime: file.modifiedTime,
+    sizeBytes: file.size ? Number(file.size) : null,
+  };
 }
 
 /** True when Drive's copy differs from what we last indexed. */
@@ -69,50 +72,6 @@ function hasChanged(file: DriveFile, row: RegistryRow | undefined): boolean {
     return new Date(file.modifiedTime).getTime() !== new Date(row.modified_time).getTime();
   }
   return true;
-}
-
-async function indexOneFile(
-  file: DriveFile,
-  chunkSize: number,
-  chunkOverlap: number,
-): Promise<{ chunks: number; chars: number }> {
-  const db = supabaseAdmin();
-
-  const { buffer, effectiveMime } = await downloadFile(file);
-  const text = await extractTextFrom(buffer, effectiveMime, file.name);
-
-  const title = titleOf(file.name);
-  const pieces = chunkText(text, chunkSize, chunkOverlap);
-  if (pieces.length === 0) {
-    throw new UnsupportedFile(`${file.name}: produced no usable chunks.`);
-  }
-
-  // Replace-then-insert, so re-indexing an edited file never leaves the old
-  // version's chunks behind to be retrieved alongside the new ones.
-  const { error: delError } = await db.rpc("delete_drive_chunks", {
-    p_drive_file_id: file.id,
-  });
-  if (delError) throw new Error(`Couldn't clear old chunks: ${delError.message}`);
-
-  // The leading "Product:" line gives the embedding the document's title for
-  // context; kb_documents.fts strips that same line, so it can't dominate the
-  // keyword half of the hybrid search.
-  const chunks = pieces.map((content, i) => ({
-    product: title,
-    file_name: file.name,
-    source_url: sourceUrl(file),
-    category: "drive",
-    source: "drive",
-    drive_file_id: file.id,
-    chunk_index: i,
-    content: `Product: ${title}\n${content}`,
-  }));
-
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-    await callEdgeFunction("ingest", { chunks: chunks.slice(i, i + EMBED_BATCH) });
-  }
-
-  return { chunks: chunks.length, chars: text.length };
 }
 
 export async function runSync(opts: {
@@ -141,7 +100,11 @@ export async function runSync(opts: {
   const { settings } = await readSettings();
   const folderId = settings.driveFolderId?.trim();
   if (!folderId) {
-    return { ...empty, error: "No Drive folder configured — finish step 1 of the wizard first." };
+    return {
+      ...empty,
+      error:
+        "No Drive folder configured. Upload files on the knowledge page, or finish step 1 of the wizard to connect Drive.",
+    };
   }
 
   const { data: runRow } = await db
@@ -192,50 +155,41 @@ export async function runSync(opts: {
   const ignored = driveFiles.filter((f) => !allowed.has(f.mimeType));
   result.scanned = driveFiles.length;
 
+  // Only Drive rows take part in this diff — uploaded documents are not in the
+  // folder and must never be treated as deleted from it.
   const { data: registryRows } = await db
     .from("kb_sources")
-    .select("drive_file_id, md5, modified_time, status");
+    .select("source_key, md5, modified_time, status")
+    .eq("source_type", "drive");
   const registry = new Map<string, RegistryRow>(
-    ((registryRows ?? []) as RegistryRow[]).map((r) => [r.drive_file_id, r]),
+    ((registryRows ?? []) as RegistryRow[]).map((r) => [r.source_key, r]),
   );
 
   // 1. Files deleted from Drive lose their chunks, so Hermes stops quoting them.
   const present = new Set(driveFiles.map((f) => f.id));
-  for (const [id, row] of registry) {
-    if (present.has(id) || row.status === "removed") continue;
-    await db.rpc("delete_drive_chunks", { p_drive_file_id: id });
-    await db
-      .from("kb_sources")
-      .update({ status: "removed", chunk_count: 0, indexed_at: new Date().toISOString() })
-      .eq("drive_file_id", id);
+  for (const [key, row] of registry) {
+    if (present.has(key) || row.status === "removed") continue;
+    await removeSource(key);
     result.removed += 1;
-    result.files.push({ driveFileId: id, name: id, status: "removed" });
+    result.files.push({ sourceKey: key, name: key, status: "removed" });
   }
 
   // 2. Types the wizard didn't tick are recorded once, not retried every run.
   for (const file of ignored) {
-    const row = registry.get(file.id);
-    if (row?.status === "skipped") continue;
-    await db.from("kb_sources").upsert(
-      {
-        drive_file_id: file.id,
-        name: file.name,
-        mime_type: file.mimeType,
-        modified_time: file.modifiedTime,
-        size_bytes: file.size ? Number(file.size) : null,
-        md5: file.md5Checksum ?? null,
-        status: "skipped",
-        chunk_count: 0,
-        error: "File type is not selected in the knowledge rules step.",
-      },
-      { onConflict: "drive_file_id" },
+    if (registry.get(file.id)?.status === "skipped") continue;
+    await markFailed(
+      toSourceDoc(file),
+      "File type is not selected in the knowledge rules step.",
+      true,
     );
   }
 
   // 3. Index what's new or edited, within the time budget.
   const queue = candidates.filter((f) => hasChanged(f, registry.get(f.id)));
-  const chunkSize = clampChunkSize(Number(settings.chunkSize));
-  const chunkOverlap = Number(settings.chunkOverlap) || 0;
+  const indexOpts = {
+    chunkSize: clampChunkSize(Number(settings.chunkSize)),
+    chunkOverlap: Number(settings.chunkOverlap) || 0,
+  };
   const maxFiles = opts.maxFiles ?? queue.length;
   let processed = 0;
 
@@ -244,62 +198,32 @@ export async function runSync(opts: {
     // Stop before the timeout rather than in the middle of a file.
     if (processed > 0 && Date.now() - started > budgetMs) break;
 
-    const isUpdate = registry.get(file.id)?.status === "indexed";
+    const wasIndexed = registry.get(file.id)?.status === "indexed";
+    const doc = toSourceDoc(file);
     processed += 1;
 
+    let outcome: IndexOutcome;
     try {
-      const { chunks, chars } = await indexOneFile(file, chunkSize, chunkOverlap);
-
-      await db.from("kb_sources").upsert(
-        {
-          drive_file_id: file.id,
-          name: file.name,
-          mime_type: file.mimeType,
-          modified_time: file.modifiedTime,
-          size_bytes: file.size ? Number(file.size) : null,
-          md5: file.md5Checksum ?? null,
-          status: "indexed",
-          chunk_count: chunks,
-          char_count: chars,
-          error: null,
-          indexed_at: new Date().toISOString(),
-        },
-        { onConflict: "drive_file_id" },
+      const { buffer, effectiveMime } = await downloadFile(file);
+      // A Google Doc arrives as exported text, so the MIME the indexer sees is
+      // the exported one, not the Drive one.
+      outcome = await indexAndRecord(
+        { ...doc, mimeType: effectiveMime },
+        buffer,
+        indexOpts,
+        wasIndexed,
       );
-
-      result.chunksAdded += chunks;
-      if (isUpdate) result.updated += 1;
-      else result.indexed += 1;
-      result.files.push({
-        driveFileId: file.id,
-        name: file.name,
-        status: isUpdate ? "updated" : "indexed",
-        chunks,
-      });
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      await db.from("kb_sources").upsert(
-        {
-          drive_file_id: file.id,
-          name: file.name,
-          mime_type: file.mimeType,
-          modified_time: file.modifiedTime,
-          size_bytes: file.size ? Number(file.size) : null,
-          md5: file.md5Checksum ?? null,
-          status: e instanceof UnsupportedFile ? "skipped" : "failed",
-          chunk_count: 0,
-          error: reason,
-        },
-        { onConflict: "drive_file_id" },
-      );
-      result.failed += 1;
-      result.files.push({
-        driveFileId: file.id,
-        name: file.name,
-        status: e instanceof UnsupportedFile ? "skipped" : "failed",
-        reason,
-      });
+      await markFailed(doc, reason);
+      outcome = { sourceKey: file.id, name: file.name, status: "failed", reason };
     }
+
+    result.files.push(outcome);
+    if (outcome.status === "indexed") result.indexed += 1;
+    else if (outcome.status === "updated") result.updated += 1;
+    else result.failed += 1;
+    result.chunksAdded += outcome.chunks ?? 0;
   }
 
   result.pending = Math.max(queue.length - processed, 0);

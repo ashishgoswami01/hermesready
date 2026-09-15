@@ -5,10 +5,11 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
  * Embeds plain-text chunks with Supabase's built-in gte-small model (384 dims,
  * no external API key) and inserts them into kb_documents.
  *
- * Used twice: once for the one-off prospectus load, and now on every Drive
- * sync. The Next.js app does the downloading, text extraction and chunking —
- * only the embedding has to happen here, because Supabase.ai exists only in
- * this runtime.
+ * Every ingestion path ends here — the one-off prospectus load, an admin-page
+ * upload, a Drive sync. The Next.js app does the downloading, text extraction
+ * and chunking; only the embedding has to happen in this runtime, because
+ * Supabase.ai exists nowhere else. That is what keeps embeddings free and
+ * key-less.
  */
 
 const session = new Supabase.ai.Session("gte-small");
@@ -26,8 +27,8 @@ type Chunk = {
   category?: string;
   chunk_index: number;
   content: string;
-  source?: "prospectus" | "drive";
-  drive_file_id?: string;
+  source?: "prospectus" | "drive" | "upload";
+  source_key?: string;
   has_premium_figures?: boolean;
 };
 

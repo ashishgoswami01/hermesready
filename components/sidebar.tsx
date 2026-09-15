@@ -77,7 +77,7 @@ export function Sidebar() {
       <div className="m-2 rounded-[8px] border border-border-base bg-surface p-3">
         <div className="eyebrow">Phase 2</div>
         <p className="mt-1.5 text-[12.5px] leading-relaxed text-text-secondary">
-          Drive ingestion and grounded answers are live. WhatsApp routing is next.
+          Upload, indexing and grounded answers are live. WhatsApp routing is next.
         </p>
       </div>
     </aside>

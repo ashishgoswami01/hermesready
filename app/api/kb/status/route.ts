@@ -7,8 +7,13 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export type KbStatus = {
-  configured: boolean;
-  totals: { chunks: number; prospectusChunks: number; driveChunks: number };
+  driveConfigured: boolean;
+  totals: {
+    chunks: number;
+    prospectusChunks: number;
+    driveChunks: number;
+    uploadChunks: number;
+  };
   files: {
     total: number;
     indexed: number;
@@ -18,7 +23,8 @@ export type KbStatus = {
     pending: number;
   };
   sources: Array<{
-    driveFileId: string;
+    sourceKey: string;
+    sourceType: "drive" | "upload";
     name: string;
     mimeType: string | null;
     status: string;
@@ -26,6 +32,7 @@ export type KbStatus = {
     error: string | null;
     indexedAt: string | null;
     modifiedTime: string | null;
+    hasStoredCopy: boolean;
   }>;
   lastRun: {
     id: number;
@@ -48,16 +55,20 @@ export async function GET() {
     const db = supabaseAdmin();
     const { settings } = await readSettings();
 
-    const [allChunks, driveChunks, sources, runs] = await Promise.all([
+    const [allChunks, driveChunks, uploadChunks, sources, runs] = await Promise.all([
       db.from("kb_documents").select("*", { count: "exact", head: true }),
       db
         .from("kb_documents")
         .select("*", { count: "exact", head: true })
         .eq("source", "drive"),
       db
+        .from("kb_documents")
+        .select("*", { count: "exact", head: true })
+        .eq("source", "upload"),
+      db
         .from("kb_sources")
         .select(
-          "drive_file_id, name, mime_type, status, chunk_count, error, indexed_at, modified_time",
+          "source_key, source_type, storage_path, name, mime_type, status, chunk_count, error, indexed_at, modified_time",
         )
         .order("indexed_at", { ascending: false, nullsFirst: false })
         .limit(200),
@@ -69,17 +80,19 @@ export async function GET() {
     ]);
 
     const rows = sources.data ?? [];
-    const count = (status: string) => rows.filter((r) => r.status === status).length;
+    const count = (s: string) => rows.filter((r) => r.status === s).length;
     const total = allChunks.count ?? 0;
     const drive = driveChunks.count ?? 0;
+    const upload = uploadChunks.count ?? 0;
     const run = runs.data?.[0];
 
     const status: KbStatus = {
-      configured: Boolean(settings.driveFolderId?.trim()),
+      driveConfigured: Boolean(settings.driveFolderId?.trim()),
       totals: {
         chunks: total,
-        prospectusChunks: total - drive,
+        prospectusChunks: total - drive - upload,
         driveChunks: drive,
+        uploadChunks: upload,
       },
       files: {
         total: rows.length,
@@ -90,7 +103,8 @@ export async function GET() {
         pending: count("pending"),
       },
       sources: rows.map((r) => ({
-        driveFileId: r.drive_file_id,
+        sourceKey: r.source_key,
+        sourceType: r.source_type as "drive" | "upload",
         name: r.name,
         mimeType: r.mime_type,
         status: r.status,
@@ -98,6 +112,7 @@ export async function GET() {
         error: r.error,
         indexedAt: r.indexed_at,
         modifiedTime: r.modified_time,
+        hasStoredCopy: Boolean(r.storage_path),
       })),
       lastRun: run
         ? {
